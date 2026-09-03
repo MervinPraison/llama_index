@@ -1,15 +1,20 @@
 import functools
 import inspect
+import logging
 from collections import OrderedDict
+from contextvars import copy_context
 from typing import Any, Optional, Sequence
 
 from llama_index.observability.otel import LlamaIndexOpenTelemetry
 from llama_index.observability.otel.base import (
     SERVICE_NAME,
     ConsoleSpanExporter,
+    OTelCompatibleEventHandler,
     OTelCompatibleSpanHandler,
     Resource,
 )
+from llama_index_instrumentation.base import BaseEvent
+from llama_index_instrumentation.span import active_span_id
 from llama_index.observability.otel.utils import flatten_dict
 from opentelemetry import context, trace
 from opentelemetry.sdk.trace import Event, ReadableSpan, SpanProcessor, TracerProvider
@@ -265,6 +270,44 @@ def make_handler():
     return exporter, handler, provider
 
 
+def enter_llama_span(
+    handler: OTelCompatibleSpanHandler,
+    span_id: str,
+    parent_id: Optional[str] = None,
+) -> None:
+    handler.span_enter(id_=span_id, bound_args=_bound, parent_id=parent_id)
+
+
+def exit_llama_span(handler: OTelCompatibleSpanHandler, span_id: str) -> None:
+    handler.span_exit(id_=span_id, bound_args=_bound)
+
+
+def finished_spans_by_name(
+    exporter: InMemorySpanExporter,
+    provider: TracerProvider,
+) -> dict[str, ReadableSpan]:
+    provider.force_flush()
+    spans = exporter.get_finished_spans()
+    spans_by_name = {span.name: span for span in spans}
+    assert len(spans_by_name) == len(spans)
+    return spans_by_name
+
+
+def assert_parent(child: ReadableSpan, parent: ReadableSpan) -> None:
+    assert child.parent is not None
+    assert child.parent.span_id == parent.context.span_id
+    assert child.parent.trace_id == parent.context.trace_id
+
+
+def assert_trace_chain(
+    spans_by_name: dict[str, ReadableSpan],
+    expected_chain: Sequence[str],
+) -> None:
+    assert set(spans_by_name) == set(expected_chain)
+    for parent_name, child_name in zip(expected_chain, expected_chain[1:]):
+        assert_parent(spans_by_name[child_name], spans_by_name[parent_name])
+
+
 def test_span_name_strips_uuid() -> None:
     exporter, handler, provider = make_handler()
     handler.span_enter(id_="MyWorkflow.run-abc123-def", bound_args=_bound)
@@ -357,17 +400,118 @@ def test_tags_not_mutated_by_new_span() -> None:
     assert tags == original_tags
 
 
+def test_span_enter_makes_otel_span_current_for_downstream_spans() -> None:
+    # Expected trace:
+    # root
+    #   downstream-child
+    exporter, handler, provider = make_handler()
+    clean_token = context.attach(context.Context())
+    try:
+        downstream_tracer = provider.get_tracer("downstream")
+
+        enter_llama_span(handler, "root-uuid")
+        root_otel_span = handler.all_spans["root-uuid"]
+        assert trace.get_current_span() is root_otel_span
+
+        with downstream_tracer.start_as_current_span("downstream-child"):
+            pass
+
+        exit_llama_span(handler, "root-uuid")
+
+        spans = finished_spans_by_name(exporter, provider)
+        assert_trace_chain(spans, ["root", "downstream-child"])
+        assert trace.get_current_span() is not root_otel_span
+    finally:
+        context.detach(clean_token)
+
+
+def test_otel_context_is_source_of_truth_when_external_spans_interleave() -> None:
+    # Expected trace:
+    # external-root
+    #   llama_parent
+    #     external-child
+    #       llama_child
+    exporter, handler, provider = make_handler()
+    clean_token = context.attach(context.Context())
+    tracer = provider.get_tracer("external")
+
+    try:
+        with tracer.start_as_current_span("external-root"):
+            enter_llama_span(handler, "llama_parent")
+            with tracer.start_as_current_span("external-child"):
+                enter_llama_span(
+                    handler,
+                    "llama_child",
+                    parent_id="llama_parent",
+                )
+                exit_llama_span(handler, "llama_child")
+            exit_llama_span(handler, "llama_parent")
+
+        spans = finished_spans_by_name(exporter, provider)
+        assert_trace_chain(
+            spans,
+            ["external-root", "llama_parent", "external-child", "llama_child"],
+        )
+    finally:
+        context.detach(clean_token)
+
+
+def test_span_exit_ends_span_when_context_detach_fails() -> None:
+    exporter, handler, provider = make_handler()
+    clean_token = context.attach(context.Context())
+
+    try:
+        handler.span_enter(id_="root-uuid", bound_args=_bound)
+
+        class FailingTokenVar:
+            def reset(self, token: Any) -> None:
+                raise RuntimeError("detach failed")
+
+        class FailingToken:
+            var = FailingTokenVar()
+
+        handler._context_tokens["root-uuid"] = (  # type: ignore[assignment]
+            FailingToken()
+        )
+        handler.span_exit(id_="root-uuid", bound_args=_bound)
+        provider.force_flush()
+
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].end_time is not None
+        assert handler.all_spans == {}
+        assert handler._context_tokens == {}
+    finally:
+        context.detach(clean_token)
+
+
+def test_span_exit_from_copied_context_does_not_log_detach_error(caplog: Any) -> None:
+    exporter, handler, provider = make_handler()
+    clean_token = context.attach(context.Context())
+
+    try:
+        handler.span_enter(id_="root-uuid", bound_args=_bound)
+        caplog.set_level(logging.ERROR, logger="opentelemetry.context")
+
+        copy_context().run(handler.span_exit, id_="root-uuid", bound_args=_bound)
+        provider.force_flush()
+
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].end_time is not None
+        assert "Failed to detach context" not in caplog.text
+    finally:
+        context.detach(clean_token)
+
+
 def test_capture_propagation_context() -> None:
     """capture_propagation_context returns a dict with traceparent when a span is active."""
     exporter, handler, provider = make_handler()
     # Create a span so there's an active trace context
     handler.span_enter(id_="root-uuid", bound_args=_bound)
-    # Activate the OTel span in the current context so capture can see it
-    from opentelemetry.trace import set_span_in_context
 
     otel_span = handler.all_spans["root-uuid"]
-    ctx = set_span_in_context(otel_span)
-    context.attach(ctx)
+    assert trace.get_current_span() is otel_span
 
     captured = handler.capture_propagation_context()
     assert "otel" in captured
@@ -389,8 +533,6 @@ def test_capture_restore_propagation_roundtrip() -> None:
     - externally-set OTel context (e.g. baggage-like ambient values) propagates
       through the traceparent mechanism
     """
-    from opentelemetry.trace import set_span_in_context
-
     # --- Process A: create root span with tags, capture context ---
     exporter_a, handler_a, provider_a = make_handler()
 
@@ -398,10 +540,8 @@ def test_capture_restore_propagation_roundtrip() -> None:
     original_tags_a = dict(tags_a)
     handler_a.span_enter(id_="root-uuid", bound_args=_bound, tags=tags_a)
 
-    # Activate the OTel span in ambient context (simulating what the Dispatcher
-    # would do before a serialization boundary)
     root_otel_span = handler_a.all_spans["root-uuid"]
-    context.attach(set_span_in_context(root_otel_span))
+    assert trace.get_current_span() is root_otel_span
 
     # Capture propagation context — this is what gets serialized across the boundary
     captured_ctx = handler_a.capture_propagation_context()
@@ -486,7 +626,6 @@ def test_dispatcher_propagation_roundtrip_with_tags() -> None:
         active_instrument_tags,
         instrument_tags,
     )
-    from opentelemetry.trace import set_span_in_context
 
     exporter_a, handler_a, provider_a = make_handler()
     exporter_b, handler_b, provider_b = make_handler()
@@ -508,9 +647,8 @@ def test_dispatcher_propagation_roundtrip_with_tags() -> None:
             id_="root-uuid", bound_args=_bound, tags=active_instrument_tags.get()
         )
 
-        # Activate OTel span in ambient context
         root_otel_span = handler_a.all_spans["root-uuid"]
-        context.attach(set_span_in_context(root_otel_span))
+        assert trace.get_current_span() is root_otel_span
 
         captured = dispatcher_a.capture_propagation_context()
 
@@ -562,3 +700,104 @@ def test_flatten_dict() -> None:
     nested_dict = {"a": 1, "b": {"c": 2, "d": {"e": 3}}, "f": [1, 2, 3]}
     flattened = flatten_dict(nested_dict)
     assert flattened == {"a": 1, "b.c": 2, "b.d.e": 3, "f": [1, 2, 3]}
+
+
+# ---------------------------------------------------------------------------
+# Event routing
+# ---------------------------------------------------------------------------
+
+
+class _ProbeEvent(BaseEvent):
+    payload: str = "x"
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "ProbeEvent"
+
+
+def _event_names(span: ReadableSpan) -> list[str]:
+    return [e.name for e in span.events]
+
+
+def test_event_routed_by_ambient_span_id() -> None:
+    """The pre-existing path: an event dispatched inside an active span."""
+    exporter, handler, provider = make_handler()
+    event_handler = OTelCompatibleEventHandler(span_handler=handler)
+    handler.span_enter(id_="span-uuid", bound_args=_bound)
+
+    token = active_span_id.set("span-uuid")
+    try:
+        event_handler.handle(_ProbeEvent())
+    finally:
+        active_span_id.reset(token)
+
+    handler.span_exit(id_="span-uuid", bound_args=_bound)
+    provider.force_flush()
+    (span,) = exporter.get_finished_spans()
+    assert _event_names(span) == ["ProbeEvent"]
+
+
+def test_event_span_id_takes_precedence_over_contextvar() -> None:
+    """
+    Streaming events are stamped with an explicit span id because the
+    generator body runs in the consumer's context, where the contextvar
+    points somewhere else entirely (or nowhere).
+    """
+    exporter, handler, provider = make_handler()
+    event_handler = OTelCompatibleEventHandler(span_handler=handler)
+    handler.span_enter(id_="stream-uuid", bound_args=_bound)
+    handler.span_enter(id_="other-uuid", bound_args=_bound)
+
+    # Consumer is inside an unrelated span while iterating the stream.
+    token = active_span_id.set("other-uuid")
+    try:
+        event_handler.handle(_ProbeEvent(span_id="stream-uuid"))
+    finally:
+        active_span_id.reset(token)
+
+    handler.span_exit(id_="other-uuid", bound_args=_bound)
+    handler.span_exit(id_="stream-uuid", bound_args=_bound)
+    provider.force_flush()
+    by_name = {s.name: s for s in exporter.get_finished_spans()}
+    assert _event_names(by_name["stream"]) == ["ProbeEvent"]
+    assert _event_names(by_name["other"]) == []
+
+
+def test_event_with_span_id_but_no_ambient_context_is_kept() -> None:
+    """
+    Regression: previously dropped outright, since `active_span_id` is
+    `None` once the coroutine that created the generator has returned.
+    """
+    exporter, handler, provider = make_handler()
+    event_handler = OTelCompatibleEventHandler(span_handler=handler)
+    handler.span_enter(id_="stream-uuid", bound_args=_bound)
+
+    assert active_span_id.get() is None
+    event_handler.handle(_ProbeEvent(span_id="stream-uuid"))
+
+    handler.span_exit(id_="stream-uuid", bound_args=_bound)
+    provider.force_flush()
+    (span,) = exporter.get_finished_spans()
+    assert _event_names(span) == ["ProbeEvent"]
+
+
+def test_event_outside_any_span_is_dropped() -> None:
+    exporter, handler, provider = make_handler()
+    event_handler = OTelCompatibleEventHandler(span_handler=handler)
+    assert active_span_id.get() is None
+    event_handler.handle(_ProbeEvent())
+    assert handler._events_by_span == {}
+
+
+def test_event_for_ended_span_does_not_leak() -> None:
+    """
+    An event stamped with a span that already closed has nothing to
+    attach to; buffering it would create a bucket nothing ever drains.
+    """
+    exporter, handler, provider = make_handler()
+    event_handler = OTelCompatibleEventHandler(span_handler=handler)
+    handler.span_enter(id_="gone-uuid", bound_args=_bound)
+    handler.span_exit(id_="gone-uuid", bound_args=_bound)
+
+    event_handler.handle(_ProbeEvent(span_id="gone-uuid"))
+    assert handler._events_by_span == {}

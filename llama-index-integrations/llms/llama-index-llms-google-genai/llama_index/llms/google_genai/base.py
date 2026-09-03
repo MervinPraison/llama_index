@@ -68,7 +68,7 @@ import google.genai.types as types
 
 dispatcher = instrument.get_dispatcher(__name__)
 
-DEFAULT_MODEL = "gemini-3-flash-preview"
+DEFAULT_MODEL = "gemini-3.7-flash"
 
 if TYPE_CHECKING:
     from llama_index.core.tools.types import BaseTool
@@ -96,6 +96,7 @@ def llm_retry_decorator(f: Callable[..., Any]) -> Callable[..., Any]:
                 max_seconds=20,
             )
             return await retry(f)(self, *args, **kwargs)
+
     else:
 
         @functools.wraps(f)
@@ -133,7 +134,7 @@ class GoogleGenAI(FunctionCallingLLM):
     """
 
     model: str = Field(default=DEFAULT_MODEL, description="The Gemini model to use.")
-    temperature: float = Field(
+    temperature: Optional[float] = Field(
         default=DEFAULT_TEMPERATURE,
         description="The temperature to use during generation.",
         ge=0.0,
@@ -189,10 +190,10 @@ class GoogleGenAI(FunctionCallingLLM):
         **kwargs: Any,
     ):
         if temperature is None:
-            if "gemini-3" in model:
-                temperature = 1.0
-            else:
+            # Gemini 3-series models may error if temperature is set.
+            if "gemini-3" not in model:
                 temperature = DEFAULT_TEMPERATURE
+
         # API keys are optional. The API can be authorised via OAuth (detected
         # environmentally) or by the GOOGLE_API_KEY environment variable.
         api_key = api_key or os.getenv("GOOGLE_API_KEY", None)
@@ -427,7 +428,12 @@ class GoogleGenAI(FunctionCallingLLM):
                         top_candidate = candidates[0]
                         if response_content := top_candidate.content:
                             if parts := response_content.parts:
-                                content_delta = parts[0].text
+                                # Only use non-thought text parts for the delta
+                                content_delta = "".join(
+                                    part.text
+                                    for part in parts
+                                    if part.text and not part.thought
+                                )
 
                                 llama_resp = chat_from_gemini_response(
                                     r,
@@ -478,7 +484,12 @@ class GoogleGenAI(FunctionCallingLLM):
                         top_candidate = candidates[0]
                         if response_content := top_candidate.content:
                             if parts := response_content.parts:
-                                content_delta = parts[0].text
+                                # Only use non-thought text parts for the delta
+                                content_delta = "".join(
+                                    part.text
+                                    for part in parts
+                                    if part.text and not part.thought
+                                )
 
                                 llama_resp = chat_from_gemini_response(
                                     r,

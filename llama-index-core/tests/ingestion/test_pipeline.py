@@ -9,8 +9,16 @@ from llama_index.core.ingestion.pipeline import IngestionPipeline, DocstoreStrat
 from llama_index.core.llms.mock import MockLLM
 from llama_index.core.node_parser import SentenceSplitter, MarkdownElementNodeParser
 from llama_index.core.readers import ReaderConfig, StringIterableReader
-from llama_index.core.schema import Document, TransformComponent, BaseNode
+from llama_index.core.schema import (
+    Document,
+    TransformComponent,
+    BaseNode,
+    TextNode,
+    NodeRelationship,
+    RelatedNodeInfo,
+)
 from llama_index.core.storage.docstore import SimpleDocumentStore
+from llama_index.core.vector_stores import SimpleVectorStore
 
 
 def test_build_pipeline() -> None:
@@ -249,6 +257,104 @@ def test_pipeline_dedup_duplicates_only() -> None:
     assert len(nodes) == 0
 
 
+def test_pipeline_dedup_within_single_batch() -> None:
+    """
+    `_handle_duplicates` should deduplicate nodes that share a hash
+    within a single ingestion run, not just against the docstore.
+
+    Documents with identical text and metadata produce identical
+    `node.hash` values, so the set-based dedup must collapse them to one.
+    """
+    documents = [
+        Document(text="same content", doc_id="a"),
+        Document(text="same content", doc_id="b"),
+        Document(text="same content", doc_id="c"),
+        Document(text="unique content", doc_id="d"),
+    ]
+    pipeline = IngestionPipeline(
+        transformations=[SentenceSplitter(chunk_size=25, chunk_overlap=0)],
+        docstore=SimpleDocumentStore(),
+        docstore_strategy=DocstoreStrategy.DUPLICATES_ONLY,
+    )
+    nodes = pipeline.run(documents=documents)
+
+    hashes = {n.hash for n in nodes}
+    assert len(nodes) == len(hashes), (
+        "within-batch duplicates must be collapsed to one node per hash"
+    )
+
+
+def _nodes_sharing_ref_doc(ref_doc_id: str, count: int) -> list[BaseNode]:
+    nodes: list[BaseNode] = [
+        TextNode(text=f"chunk {i}", id_=f"node-{i}") for i in range(count)
+    ]
+    for node in nodes:
+        node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+            node_id=ref_doc_id
+        )
+    return nodes
+
+
+def test_pipeline_upserts_keep_all_nodes_per_doc() -> None:
+    """
+    Regression test: with the UPSERTS strategy, every node belonging to the
+    same source document must be ingested. `_handle_upserts` previously keyed a
+    dict by `ref_doc_id` and overwrote earlier nodes, so only the last chunk of
+    each document survived and the rest were silently dropped.
+    """
+    nodes = _nodes_sharing_ref_doc("source-doc", 5)
+    pipeline = IngestionPipeline(
+        transformations=[],
+        docstore=SimpleDocumentStore(),
+        vector_store=SimpleVectorStore(),
+        docstore_strategy=DocstoreStrategy.UPSERTS,
+    )
+
+    result = pipeline.run(nodes=nodes)
+
+    assert {n.id_ for n in result} == {n.id_ for n in nodes}, (
+        "all nodes sharing a ref_doc_id must be kept, not collapsed to one"
+    )
+
+
+@pytest.mark.skipif(cpu_count() < 2, reason="requires at least 2 CPUs")
+def test_pipeline_parallel_cache_populated() -> None:
+    num_workers = 2
+    docs = [
+        Document(text=f"Sample document {i}." * 20, doc_id=str(i)) for i in range(4)
+    ]
+    pipeline = IngestionPipeline(
+        transformations=[SentenceSplitter(chunk_size=25, chunk_overlap=0)]
+    )
+
+    pipeline.run(documents=docs, num_workers=num_workers)
+
+    cache_size = len(pipeline.cache.cache.get_all(collection=pipeline.cache.collection))
+    assert cache_size == num_workers
+
+
+@pytest.mark.skipif(cpu_count() < 2, reason="requires at least 2 CPUs")
+def test_pipeline_parallel_cache_reused_on_second_run() -> None:
+    num_workers = 2
+    docs = [
+        Document(text=f"Sample document {i}." * 20, doc_id=str(i)) for i in range(4)
+    ]
+    pipeline = IngestionPipeline(
+        transformations=[SentenceSplitter(chunk_size=25, chunk_overlap=0)]
+    )
+
+    pipeline.run(documents=docs, num_workers=num_workers)
+    first_size = len(pipeline.cache.cache.get_all(collection=pipeline.cache.collection))
+
+    pipeline.run(documents=docs, num_workers=num_workers)
+    second_size = len(
+        pipeline.cache.cache.get_all(collection=pipeline.cache.collection)
+    )
+
+    assert first_size == num_workers
+    assert second_size == first_size
+
+
 def test_pipeline_parallel() -> None:
     document1 = Document.example()
     document1.id_ = "1"
@@ -425,6 +531,64 @@ async def test_async_pipeline_dedup_duplicates_only() -> None:
 
     nodes = await pipeline.arun(documents=documents)
     assert len(nodes) == 0
+
+
+@pytest.mark.asyncio
+async def test_async_pipeline_upserts_keep_all_nodes_per_doc() -> None:
+    """Async counterpart of ``test_pipeline_upserts_keep_all_nodes_per_doc``."""
+    nodes = _nodes_sharing_ref_doc("source-doc", 5)
+    pipeline = IngestionPipeline(
+        transformations=[],
+        docstore=SimpleDocumentStore(),
+        vector_store=SimpleVectorStore(),
+        docstore_strategy=DocstoreStrategy.UPSERTS,
+    )
+
+    result = await pipeline.arun(nodes=nodes)
+
+    assert {n.id_ for n in result} == {n.id_ for n in nodes}, (
+        "all nodes sharing a ref_doc_id must be kept, not collapsed to one"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(cpu_count() < 2, reason="requires at least 2 CPUs")
+async def test_async_pipeline_parallel_cache_populated() -> None:
+    num_workers = 2
+    docs = [
+        Document(text=f"Sample document {i}." * 20, doc_id=str(i)) for i in range(4)
+    ]
+    pipeline = IngestionPipeline(
+        transformations=[SentenceSplitter(chunk_size=25, chunk_overlap=0)]
+    )
+
+    await pipeline.arun(documents=docs, num_workers=num_workers)
+
+    cache_size = len(pipeline.cache.cache.get_all(collection=pipeline.cache.collection))
+    assert cache_size == num_workers
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(cpu_count() < 2, reason="requires at least 2 CPUs")
+async def test_async_pipeline_parallel_cache_reused_on_second_run() -> None:
+    num_workers = 2
+    docs = [
+        Document(text=f"Sample document {i}." * 20, doc_id=str(i)) for i in range(4)
+    ]
+    pipeline = IngestionPipeline(
+        transformations=[SentenceSplitter(chunk_size=25, chunk_overlap=0)]
+    )
+
+    await pipeline.arun(documents=docs, num_workers=num_workers)
+    first_size = len(pipeline.cache.cache.get_all(collection=pipeline.cache.collection))
+
+    await pipeline.arun(documents=docs, num_workers=num_workers)
+    second_size = len(
+        pipeline.cache.cache.get_all(collection=pipeline.cache.collection)
+    )
+
+    assert first_size == num_workers
+    assert second_size == first_size
 
 
 @pytest.mark.asyncio

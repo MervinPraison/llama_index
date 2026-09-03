@@ -1,11 +1,12 @@
 """Test tools."""
 
+import contextvars
 import json
 from typing import List, Optional
 
 import pytest
 from llama_index.core.bridge.pydantic import BaseModel, Field
-from llama_index.core.llms import TextBlock, ImageBlock
+from llama_index.core.llms import TextBlock, ImageBlock, DocumentBlock, VideoBlock
 from llama_index.core.tools.function_tool import FunctionTool
 from llama_index.core.schema import Document, TextNode
 from llama_index.core.workflow.context import Context
@@ -352,6 +353,71 @@ def test_fn_schema_docstring_descriptions():
     assert fields["b"].description == "an optional string"
 
 
+def test_fn_schema_docstring_descriptions_reach_the_json_schema():
+    """
+    Docstring param descriptions must survive into the schema sent to the LLM.
+
+    Regression test: they used to be assigned to `model_fields` after
+    `create_model()` had already frozen the core schema, so `model_json_schema()`
+    -- and therefore `to_openai_tool()` -- never saw them.
+    """
+
+    def search(query: str, top_k: int = 5) -> str:
+        """
+        Search the web.
+
+        Args:
+            query (str): The search query string.
+            top_k (int): Number of results to return.
+
+        """
+        return "ok"
+
+    tool = FunctionTool.from_defaults(fn=search)
+
+    properties = tool.metadata.to_openai_tool()["function"]["parameters"]["properties"]
+    assert properties["query"]["description"] == "The search query string."
+    assert properties["top_k"]["description"] == "Number of results to return."
+
+
+def test_explicit_field_description_wins_over_docstring():
+    """A description on the parameter itself takes precedence over the docstring."""
+
+    def search(query: str = Field(default="", description="explicit")) -> str:
+        """
+        Search the web.
+
+        Args:
+            query (str): from the docstring
+
+        """
+        return "ok"
+
+    tool = FunctionTool.from_defaults(fn=search)
+
+    properties = tool.metadata.to_openai_tool()["function"]["parameters"]["properties"]
+    assert properties["query"]["description"] == "explicit"
+
+
+def test_docstring_fills_a_field_default_without_a_description():
+    """A bare `Field` default still picks the description up from the docstring."""
+
+    def search(query: str = Field(default="")) -> str:
+        """
+        Search the web.
+
+        Args:
+            query (str): The search query string.
+
+        """
+        return "ok"
+
+    tool = FunctionTool.from_defaults(fn=search)
+
+    properties = tool.metadata.to_openai_tool()["function"]["parameters"]["properties"]
+    assert properties["query"]["description"] == "The search query string."
+
+
 def test_docstring_param_extraction_javadoc_style():
     def tool_fn(foo: int, bar: str) -> str:
         """
@@ -475,3 +541,65 @@ def test_function_tool_field_default() -> None:
     # Calling with an explicit arg should override the default
     result = tool.call(location="Munich")
     assert result.content == "weather in Munich"
+
+
+@pytest.mark.asyncio
+async def test_function_tool_contextvar_propagation() -> None:
+    """Test that contextvars are propagated into sync fn via acall."""
+    var: contextvars.ContextVar[str] = contextvars.ContextVar(
+        "test_var", default="default"
+    )
+
+    def sync_fn() -> str:
+        return var.get()
+
+    tool = FunctionTool.from_defaults(fn=sync_fn, name="ctx_test", description="test")
+    var.set("expected")
+    result = await tool.acall()
+    assert result.raw_output == "expected"
+
+
+def test_function_tool_output_single_document_block() -> None:
+    """Test that a single DocumentBlock passes through without str() wrapping."""
+
+    def get_doc() -> DocumentBlock:
+        return DocumentBlock(
+            data=b"fake-pdf-bytes", document_mimetype="application/pdf"
+        )
+
+    tool = FunctionTool.from_defaults(get_doc)
+    tool_output = tool.call()
+
+    assert len(tool_output.blocks) == 1
+    assert isinstance(tool_output.blocks[0], DocumentBlock)
+
+
+def test_function_tool_output_single_video_block() -> None:
+    """Test that a single VideoBlock passes through without str() wrapping."""
+
+    def get_video() -> VideoBlock:
+        return VideoBlock(video=b"fake-video-bytes", video_mimetype="video/mp4")
+
+    tool = FunctionTool.from_defaults(get_video)
+    tool_output = tool.call()
+
+    assert len(tool_output.blocks) == 1
+    assert isinstance(tool_output.blocks[0], VideoBlock)
+
+
+def test_function_tool_output_document_and_text_blocks() -> None:
+    """Test that a list of [DocumentBlock, TextBlock] passes through as-is."""
+
+    def get_blocks() -> list:
+        return [
+            DocumentBlock(data=b"fake-pdf-bytes", document_mimetype="application/pdf"),
+            TextBlock(text="Summary of the document"),
+        ]
+
+    tool = FunctionTool.from_defaults(get_blocks)
+    tool_output = tool.call()
+
+    assert len(tool_output.blocks) == 2
+    assert isinstance(tool_output.blocks[0], DocumentBlock)
+    assert isinstance(tool_output.blocks[1], TextBlock)
+    assert tool_output.content == "Summary of the document"

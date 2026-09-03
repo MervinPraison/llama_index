@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import inspect
 from typing import (
     TYPE_CHECKING,
@@ -26,6 +27,8 @@ from llama_index.core.base.llms.types import (
     CitableBlock,
     CitationBlock,
     ContentBlock,
+    DocumentBlock,
+    VideoBlock,
 )
 from llama_index.core.bridge.pydantic import BaseModel, FieldInfo
 from llama_index.core.tools.types import AsyncBaseTool, ToolMetadata, ToolOutput
@@ -46,7 +49,8 @@ def sync_to_async(fn: Callable[..., Any]) -> AsyncCallable:
 
     async def _async_wrapped_fn(*args: Any, **kwargs: Any) -> Any:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
+        ctx = contextvars.copy_context()
+        return await loop.run_in_executor(None, lambda: ctx.run(fn, *args, **kwargs))
 
     return _async_wrapped_fn
 
@@ -240,11 +244,11 @@ class FunctionTool(AsyncBaseTool):
                     fn_to_parse,
                     additional_fields=None,
                     ignore_fields=ignore_fields,
+                    param_descriptions={
+                        param_name: doc.strip()
+                        for param_name, doc in param_docs.items()
+                    },
                 )
-                if fn_schema is not None and param_docs:
-                    for param_name, field in fn_schema.model_fields.items():
-                        if not field.description and param_name in param_docs:
-                            field.description = param_docs[param_name].strip()
 
             tool_metadata = ToolMetadata(
                 name=name,
@@ -287,12 +291,30 @@ class FunctionTool(AsyncBaseTool):
     def _parse_tool_output(self, raw_output: Any) -> List[ContentBlock]:
         """Parse tool output into content blocks."""
         if isinstance(
-            raw_output, (TextBlock, ImageBlock, AudioBlock, CitableBlock, CitationBlock)
+            raw_output,
+            (
+                TextBlock,
+                ImageBlock,
+                AudioBlock,
+                CitableBlock,
+                CitationBlock,
+                DocumentBlock,
+                VideoBlock,
+            ),
         ):
             return [raw_output]
         elif isinstance(raw_output, list) and all(
             isinstance(
-                item, (TextBlock, ImageBlock, AudioBlock, CitableBlock, CitationBlock)
+                item,
+                (
+                    TextBlock,
+                    ImageBlock,
+                    AudioBlock,
+                    CitableBlock,
+                    CitationBlock,
+                    DocumentBlock,
+                    VideoBlock,
+                ),
             )
             for item in raw_output
         ):

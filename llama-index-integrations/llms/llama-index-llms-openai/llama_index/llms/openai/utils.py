@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
@@ -75,10 +76,18 @@ O1_MODELS: Dict[str, int] = {
     "gpt-5.2": 400000,
     "gpt-5.2-2025-12-11": 400000,
     "gpt-5.2-chat-latest": 128000,
+    "gpt-5.3": 400000,
+    "gpt-5.3-chat-latest": 128000,
     "gpt-5.4": 1050000,
+    "gpt-5.4-2026-03-05": 1050000,
     "gpt-5.4-mini": 400000,
     "gpt-5.4-nano": 400000,
     "gpt-5.4-chat-latest": 128000,
+    "gpt-5.5": 1050000,
+    "gpt-5.5-2026-04-23": 1050000,
+    "gpt-5.6-sol": 1050000,
+    "gpt-5.6-luna": 1050000,
+    "gpt-5.6-terra": 1050000,
 }
 
 RESPONSES_API_ONLY_MODELS = {
@@ -227,6 +236,7 @@ JSON_SCHEMA_MODELS = [
     "gpt-5",
     "gpt-5.2",
     "gpt-5.4",
+    "gpt-5.5",
 ]
 
 
@@ -491,11 +501,15 @@ def to_openai_message_dict(
             continue
         elif isinstance(block, ToolCallBlock):
             try:
+                # OpenAI API expects arguments as a JSON string, not a dict
+                arguments = block.tool_kwargs
+                if isinstance(arguments, dict):
+                    arguments = json.dumps(arguments)
                 function_dict = {
                     "type": "function",
                     "function": {
                         "name": block.tool_name,
-                        "arguments": block.tool_kwargs,
+                        "arguments": arguments,
                     },
                     "id": block.tool_call_id,
                 }
@@ -621,10 +635,8 @@ def to_openai_responses_message_dict(
             content.append(
                 {
                     "type": "input_file",
-                    "file": {
-                        "filename": block.title,
-                        "file_data": f"data:{mimetype};base64,{b64_string}",
-                    },
+                    "filename": block.title,
+                    "file_data": f"data:{mimetype};base64,{b64_string}",
                 }
             )
         elif isinstance(block, ImageBlock):
@@ -661,11 +673,14 @@ def to_openai_responses_message_dict(
                         }
                     )
         elif isinstance(block, ToolCallBlock):
+            arguments = block.tool_kwargs
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments)
             tool_calls.extend(
                 [
                     {
                         "type": "function_call",
-                        "arguments": block.tool_kwargs,
+                        "arguments": arguments,
                         "call_id": block.tool_call_id,
                         "name": block.tool_name,
                     }
@@ -681,9 +696,17 @@ def to_openai_responses_message_dict(
             for tool_call in message.additional_kwargs["tool_calls"]
         ]
 
-        return [*reasoning, *message_dicts]
+        items = [*reasoning]
+        if content_txt not in (None, "", []):
+            items.append({"role": message.role.value, "content": content_txt})
+        items.extend(message_dicts)
+        return items
     elif tool_calls:
-        return [*reasoning, *tool_calls]
+        items = [*reasoning]
+        if content_txt not in (None, "", []):
+            items.append({"role": message.role.value, "content": content_txt})
+        items.extend(tool_calls)
+        return items
 
     # NOTE: Sending a null value (None) for Tool Message to OpenAI will cause error
     # It's only Allowed to send None if it's an Assistant Message and either a function call or tool calls were performed
@@ -712,9 +735,23 @@ def to_openai_responses_message_dict(
                 "tool_call_id or call_id is required in additional_kwargs for tool messages"
             )
 
+        # A tool may return an image or a file, and function_call_output.output takes a list
+        # of input_text / input_image / input_file parts as well as a plain string. Text is
+        # re-tagged input_text because the loop above tags it output_text for every role
+        # other than user, which function_call_output does not accept. A result that returned
+        # only text stays a string, since some openai-like APIs accept nothing else there.
+        output: Union[str, List[Dict[str, Any]]] = content_txt
+        if any(part["type"] in ("input_image", "input_file") for part in content):
+            output = [
+                {"type": "input_text", "text": part["text"]}
+                if part["type"] == "output_text"
+                else part
+                for part in content
+            ]
+
         message_dict = {
             "type": "function_call_output",
-            "output": content_txt,
+            "output": output,
             "call_id": call_id,
         }
 
@@ -786,10 +823,12 @@ def to_openai_message_dicts(
                 final_message_dicts.append(message_dicts)
 
         # If there is only one message, and it is a user message, return the content string directly
+        # .get() because not every item carries a role: a lone tool message serializes to a
+        # function_call_output, which has none.
         if (
             len(final_message_dicts) == 1
-            and final_message_dicts[0]["role"] == "user"
-            and isinstance(final_message_dicts[0]["content"], str)
+            and final_message_dicts[0].get("role") == "user"
+            and isinstance(final_message_dicts[0].get("content"), str)
         ):
             return final_message_dicts[0]["content"]
 
@@ -813,9 +852,9 @@ def from_openai_message(
     role = openai_message.role
     blocks: List[ContentBlock] = []
 
-    # Extract reasoning_content if present (used by many OpenAI-compatible
-    # providers for chain-of-thought responses)
-    reasoning_content = getattr(openai_message, "reasoning_content", None)
+    # Extract reasoning content if present. Many OpenAI-compatible providers
+    # use reasoning_content, while vLLM exposes the same trace as reasoning.
+    reasoning_content = get_openai_reasoning_content(openai_message)
     if isinstance(reasoning_content, str) and reasoning_content:
         blocks.append(ThinkingBlock(content=reasoning_content))
 
@@ -844,6 +883,19 @@ def from_openai_message(
         blocks.append(AudioBlock(audio=audio_data, format="mp3"))
 
     return ChatMessage(role=role, blocks=blocks, additional_kwargs=additional_kwargs)
+
+
+def get_openai_reasoning_content(message: Any) -> Optional[str]:
+    """Return reasoning text from OpenAI-compatible message objects."""
+    reasoning_content = getattr(message, "reasoning_content", None)
+    if isinstance(reasoning_content, str):
+        return reasoning_content
+
+    reasoning = getattr(message, "reasoning", None)
+    if isinstance(reasoning, str):
+        return reasoning
+
+    return None
 
 
 def from_openai_token_logprob(
